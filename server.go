@@ -78,6 +78,25 @@ func (s *Server) AddOnlineMap(user *User) {
 	s.mapLock.Unlock()
 }
 
+func (s *Server) DeleteOnlineMap(user *User) {
+	s.mapLock.Lock()
+	delete(s.OnlineMap, user.Name)
+	s.mapLock.Unlock()
+}
+
+func (s *Server) UpdateOnlineMap(user *User, newName string) bool {
+	if _, ok := s.OnlineMap[newName]; ok {
+		user.C <- "该用户名已被使用"
+		return false
+	} else {
+		s.DeleteOnlineMap(user)
+		user.Name = newName
+		s.AddOnlineMap(user)
+
+		return true
+	}
+}
+
 // PushMessage 添加一条消息到消息渠道
 func (s *Server) PushMessage(user *User, msg string) {
 	s.Message <- fmt.Sprintf("[%s]:%s", user.Name, msg)
