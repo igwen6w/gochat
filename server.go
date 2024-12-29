@@ -3,15 +3,27 @@ package main
 import (
 	"fmt"
 	"net"
+	"sync"
 )
 
 type Server struct {
 	Ip   string
 	Port int
+	// online map
+	OnlineMap map[string]*User
+	mapLock   sync.RWMutex
+
+	// 广播消息渠道
+	Message chan string
 }
 
 func NewServer(ip string, port int) *Server {
-	return &Server{Ip: ip, Port: port}
+	return &Server{
+		Ip:        ip,
+		Port:      port,
+		OnlineMap: make(map[string]*User),
+		Message:   make(chan string),
+	}
 }
 
 func (s *Server) Run() {
@@ -25,6 +37,7 @@ func (s *Server) Run() {
 	defer listener.Close()
 
 	for {
+		// 监听连接
 		conn, err := listener.Accept()
 		if err != nil {
 			fmt.Println("Error accepting connection")
@@ -32,10 +45,46 @@ func (s *Server) Run() {
 		}
 
 		go s.Handler(conn)
+
+		go s.BroadCastMessage()
 	}
 }
 
 func (s *Server) Handler(conn net.Conn) {
 	// 业务逻辑
-	fmt.Println("服务器已创建连接")
+	fmt.Println("用户创建连接")
+
+	// 用户上线
+	s.UserOnline(conn)
+
+	select {}
+}
+
+func (s *Server) UserOnline(conn net.Conn) {
+	// 创建用户
+	user := newUser(conn)
+
+	// 加入在线用户列表
+	s.mapLock.Lock()
+	s.OnlineMap[user.Name] = user
+	s.mapLock.Unlock()
+
+	s.PushMessage(user, "上线了")
+}
+
+// PushMessage 添加一条消息到消息渠道
+func (s *Server) PushMessage(user *User, msg string) {
+	s.Message <- fmt.Sprintf("[%s]:%s", user.Name, msg)
+}
+
+// BroadCastMessage 广播消息
+func (s *Server) BroadCastMessage() {
+	for {
+		msg := <-s.Message
+		// server log
+		fmt.Println(msg)
+		for _, user := range s.OnlineMap {
+			user.C <- msg
+		}
+	}
 }
