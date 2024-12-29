@@ -36,6 +36,9 @@ func (s *Server) Run() {
 
 	defer listener.Close()
 
+	// 广播消息
+	go s.BroadCastMessage()
+
 	for {
 		// 监听连接
 		conn, err := listener.Accept()
@@ -45,8 +48,6 @@ func (s *Server) Run() {
 		}
 
 		go s.Handler(conn)
-
-		go s.BroadCastMessage()
 	}
 }
 
@@ -62,14 +63,19 @@ func (s *Server) Handler(conn net.Conn) {
 
 func (s *Server) UserOnline(conn net.Conn) {
 	// 创建用户
-	user := newUser(conn)
+	user := newUser(conn, s)
 
 	// 加入在线用户列表
+	s.AddOnlineMap(user)
+
+	// 发送用户上线消息
+	s.PushMessage(user, "上线了")
+}
+
+func (s *Server) AddOnlineMap(user *User) {
 	s.mapLock.Lock()
 	s.OnlineMap[user.Name] = user
 	s.mapLock.Unlock()
-
-	s.PushMessage(user, "上线了")
 }
 
 // PushMessage 添加一条消息到消息渠道
