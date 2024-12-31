@@ -1,6 +1,9 @@
 package main
 
 func main() {
-	server := NewServer("127.0.0.1", 8989)
-	server.Run()
+	server := NewServer(DefaultConfig())
+	err := server.Run()
+	if err != nil {
+		return
+	}
 }
