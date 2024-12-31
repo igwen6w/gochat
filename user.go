@@ -9,52 +9,57 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
+const (
+	inactivityTimeout     = 10 * time.Second
+	bufferSize            = 1024
+	activityCheckInterval = time.Second
+)
+
 type User struct {
-	Name       string        // 用户名，也是地址
-	C          chan string   // 消息通道
-	Conn       net.Conn      // 网络连接
-	Server     *Server       // 所属服务器
-	LastActive *time.Time    // 最后活动时间指针
-	ctx        context.Context // 带取消的上下文
-	cancel     context.CancelFunc // 取消函数
-	offlineOnce sync.Once    // 确保下线操作只执行一次
+	Name        string
+	C           chan string
+	Conn        net.Conn
+	Server      *Server
+	lastActive  atomic.Value // 使用原子操作替代指针
+	ctx         context.Context
+	cancel      context.CancelFunc
+	offlineOnce sync.Once
 }
 
 func newUser(conn net.Conn, server *Server) *User {
-	userAddr := conn.RemoteAddr().String()
 	ctx, cancel := context.WithCancel(context.Background())
-	now := time.Now()
 	user := &User{
-		Name:       userAddr,
-		C:          make(chan string),
-		Conn:       conn,
-		Server:     server,
-		LastActive: &now,
-		ctx:        ctx,
-		cancel:     cancel,
+		Name:   conn.RemoteAddr().String(),
+		C:      make(chan string, bufferSize), // 添加缓冲区
+		Conn:   conn,
+		Server: server,
+		ctx:    ctx,
+		cancel: cancel,
 	}
 
-	// 启动goroutines
-	go user.ShowMessage()
-	go user.ListenMessage()
-	go user.CheckActivity()
+	user.lastActive.Store(time.Now())
 
-	log.Printf("新用户连接: %s\n", userAddr)
+	go user.handleMessages() // 合并消息处理
+	go user.monitorActivity()
+
+	log.Printf("新用户连接: %s", user.Name)
 	return user
 }
 
-func (u *User) CheckActivity() {
-	ticker := time.NewTicker(1 * time.Second)
+func (u *User) monitorActivity() {
+	ticker := time.NewTicker(activityCheckInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			if time.Since(*u.LastActive) > 10*time.Second {
-				log.Printf("用户 %s 因超时下线\n", u.Name)
+			lastActive := u.lastActive.Load().(time.Time)
+			if time.Since(lastActive) > inactivityTimeout {
+				log.Printf("用户 %s 因超时下线", u.Name)
 				u.OffLine()
 				return
 			}
@@ -64,45 +69,60 @@ func (u *User) CheckActivity() {
 	}
 }
 
-func (u *User) ListenMessage() {
-	buf := make([]byte, 1024)
+func (u *User) handleMessages() {
+	go u.readMessages() // 读取消息
+	u.writeMessages()   // 写入消息
+}
+
+func (u *User) readMessages() {
+	buf := make([]byte, bufferSize)
 	for {
 		select {
 		case <-u.ctx.Done():
 			return
 		default:
 			n, err := u.Conn.Read(buf)
-			if err != nil {
-				if err != io.EOF {
-					log.Printf("用户 %s 读取错误: %v\n", u.Name, err)
+			if err != nil || n == 0 {
+				if err != nil && err != io.EOF {
+					log.Printf("用户 %s 读取错误: %v", u.Name, err)
 				}
 				u.OffLine()
 				return
 			}
 
-			if n == 0 {
-				log.Printf("用户 %s 断开连接\n", u.Name)
-				u.OffLine()
-				return
-			}
-
-			now := time.Now()
-			u.LastActive = &now
+			u.lastActive.Store(time.Now())
 			msg := strings.TrimSpace(string(buf[:n]))
-			u.SendMessage(msg)
+			u.processMessage(msg)
 		}
 	}
 }
 
-// SendMessage 处理并发送消息
-func (u *User) SendMessage(msg string) {
+func (u *User) writeMessages() {
+	for {
+		select {
+		case message, ok := <-u.C:
+			if !ok {
+				return
+			}
+			if err := u.writeMessage(message); err != nil {
+				log.Printf("用户 %s 发送消息失败: %v", u.Name, err)
+				return
+			}
+		case <-u.ctx.Done():
+			return
+		}
+	}
+}
+
+func (u *User) writeMessage(message string) error {
+	_, err := u.Conn.Write([]byte(fmt.Sprintf("%s\n", message)))
+	return err
+}
+
+func (u *User) processMessage(msg string) {
 	switch {
 	case msg == "who":
-		u.Server.mapLock.Lock()
-		for name := range u.Server.OnlineMap {
-			u.C <- name + "_在线"
-		}
-		u.Server.mapLock.Unlock()
+		u.listOnlineUsers()
 	case msg == "Ping":
 		u.C <- "Pong"
 	case msg == "offline" || msg == "exit":
@@ -110,49 +130,45 @@ func (u *User) SendMessage(msg string) {
 	case strings.HasPrefix(msg, "rename|"):
 		u.Rename(strings.TrimPrefix(msg, "rename|"))
 	case strings.HasPrefix(msg, "to|"):
-		parts := strings.SplitN(msg, "|", 3)
-		if len(parts) == 3 {
-			if user, ok := u.Server.OnlineMap[parts[1]]; ok {
-				u.ToMessage(user, parts[2])
-			}
-		}
+		u.handlePrivateMessage(msg)
 	default:
 		u.Server.PushMessage(u, msg)
 	}
 }
 
-// ShowMessage 显示消息
-func (u *User) ShowMessage() {
-	for {
-		select {
-		case message, ok := <-u.C:
-			if !ok {
-				return
-			}
-			_, err := u.Conn.Write([]byte(fmt.Sprintf("%s\n", message)))
-			if err != nil {
-				log.Printf("用户 %s 发送消息失败: %v\n", u.Name, err)
-				return
-			}
-		case <-u.ctx.Done():
-			return
-		}
+func (u *User) listOnlineUsers() {
+	u.Server.mapLock.RLock() // 使用读锁而不是写锁
+	defer u.Server.mapLock.RUnlock()
+
+	for name := range u.Server.OnlineMap {
+		u.C <- name + "_在线"
 	}
 }
 
-// OffLine 用户下线
+func (u *User) handlePrivateMessage(msg string) {
+	parts := strings.SplitN(msg, "|", 3)
+	if len(parts) != 3 {
+		return
+	}
+
+	u.Server.mapLock.RLock()
+	targetUser, exists := u.Server.OnlineMap[parts[1]]
+	u.Server.mapLock.RUnlock()
+
+	if exists {
+		targetUser.C <- fmt.Sprintf("%s:%s", u.Name, parts[2])
+	}
+}
+
 func (u *User) OffLine() {
 	u.offlineOnce.Do(func() {
 		u.cancel()
-
 		u.Server.DeleteOnlineMap(u)
-
 		u.Server.PushMessage(u, "下线了")
-
 		close(u.C)
 
 		if err := u.Conn.Close(); err != nil {
-			log.Printf("关闭用户 %s 连接失败: %v\n", u.Name, err)
+			log.Printf("关闭用户 %s 连接失败: %v", u.Name, err)
 		}
 
 		runtime.Goexit()
@@ -161,14 +177,7 @@ func (u *User) OffLine() {
 
 func (u *User) Rename(newName string) {
 	oldName := u.Name
-	// 更新
-	r := u.Server.UpdateOnlineMap(u, newName)
-	if r {
-		// 广播改名消息
+	if u.Server.UpdateOnlineMap(u, newName) {
 		u.Server.PushMessage(u, fmt.Sprintf("从 %s 改为 %s", oldName, newName))
 	}
-}
-
-func (u *User) ToMessage(user *User, msg string) {
-	user.C <- fmt.Sprintf("%s:%s", u.Name, msg)
 }
