@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"runtime"
 	"strings"
@@ -11,37 +13,36 @@ import (
 )
 
 type User struct {
-	Name        string
-	Addr        string
-	C           chan string
-	Conn        net.Conn
-	Server      *Server
-	LastActive  time.Time     // 最后活动时间
-	done        chan struct{} // 用于通知goroutine退出
-	offlineOnce sync.Once     // 确保下线操作只执行一次
+	Name       string        // 用户名，也是地址
+	C          chan string   // 消息通道
+	Conn       net.Conn      // 网络连接
+	Server     *Server       // 所属服务器
+	LastActive *time.Time    // 最后活动时间指针
+	ctx        context.Context // 带取消的上下文
+	cancel     context.CancelFunc // 取消函数
+	offlineOnce sync.Once    // 确保下线操作只执行一次
 }
 
 func newUser(conn net.Conn, server *Server) *User {
 	userAddr := conn.RemoteAddr().String()
+	ctx, cancel := context.WithCancel(context.Background())
+	now := time.Now()
 	user := &User{
 		Name:       userAddr,
-		Addr:       userAddr,
 		C:          make(chan string),
 		Conn:       conn,
 		Server:     server,
-		LastActive: time.Now(),
-		done:       make(chan struct{}),
+		LastActive: &now,
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 
-	// 接收显示消息
+	// 启动goroutines
 	go user.ShowMessage()
-
-	// 监听消息和指令
 	go user.ListenMessage()
-
-	// 启动定时检查
 	go user.CheckActivity()
 
+	log.Printf("新用户连接: %s\n", userAddr)
 	return user
 }
 
@@ -52,11 +53,12 @@ func (u *User) CheckActivity() {
 	for {
 		select {
 		case <-ticker.C:
-			if time.Since(u.LastActive) > 10*time.Second {
+			if time.Since(*u.LastActive) > 10*time.Second {
+				log.Printf("用户 %s 因超时下线\n", u.Name)
 				u.OffLine()
 				return
 			}
-		case <-u.done:
+		case <-u.ctx.Done():
 			return
 		}
 	}
@@ -66,53 +68,55 @@ func (u *User) ListenMessage() {
 	buf := make([]byte, 1024)
 	for {
 		select {
-		case <-u.done:
+		case <-u.ctx.Done():
 			return
 		default:
 			n, err := u.Conn.Read(buf)
-			if err != nil && err != io.EOF {
-				fmt.Println("conn.read err:", err)
+			if err != nil {
+				if err != io.EOF {
+					log.Printf("用户 %s 读取错误: %v\n", u.Name, err)
+				}
 				u.OffLine()
 				return
 			}
 
 			if n == 0 {
+				log.Printf("用户 %s 断开连接\n", u.Name)
 				u.OffLine()
 				return
 			}
 
-			u.LastActive = time.Now()
-			u.SendMessage(string(buf[:n-1]))
+			now := time.Now()
+			u.LastActive = &now
+			msg := strings.TrimSpace(string(buf[:n]))
+			u.SendMessage(msg)
 		}
 	}
 }
 
-// SendMessage 发送消息
+// SendMessage 处理并发送消息
 func (u *User) SendMessage(msg string) {
-	if msg == "who" {
+	switch {
+	case msg == "who":
 		u.Server.mapLock.Lock()
-		for name, _ := range u.Server.OnlineMap {
+		for name := range u.Server.OnlineMap {
 			u.C <- name + "_在线"
 		}
 		u.Server.mapLock.Unlock()
-	} else if msg == "Ping" {
+	case msg == "Ping":
 		u.C <- "Pong"
-	} else if msg == "offline" || msg == "exit" {
+	case msg == "offline" || msg == "exit":
 		u.OffLine()
-		return
-	} else if len(msg) >= 8 && msg[0:7] == "rename|" {
-		// 用户重命名，格式：rename|string
-		u.Rename(msg[7:])
-	} else if len(msg) > 4 && msg[:3] == "to|" {
-		// 格式：to|name|message
-		a := strings.Split(msg, "|")
-		if name := a[1]; len(name) > 0 {
-			if user, ok := u.Server.OnlineMap[name]; ok {
-				// 给用户发送消息
-				u.ToMessage(user, a[2])
+	case strings.HasPrefix(msg, "rename|"):
+		u.Rename(strings.TrimPrefix(msg, "rename|"))
+	case strings.HasPrefix(msg, "to|"):
+		parts := strings.SplitN(msg, "|", 3)
+		if len(parts) == 3 {
+			if user, ok := u.Server.OnlineMap[parts[1]]; ok {
+				u.ToMessage(user, parts[2])
 			}
 		}
-	} else {
+	default:
 		u.Server.PushMessage(u, msg)
 	}
 }
@@ -125,8 +129,12 @@ func (u *User) ShowMessage() {
 			if !ok {
 				return
 			}
-			u.Conn.Write([]byte(fmt.Sprintf("%s\n", message)))
-		case <-u.done:
+			_, err := u.Conn.Write([]byte(fmt.Sprintf("%s\n", message)))
+			if err != nil {
+				log.Printf("用户 %s 发送消息失败: %v\n", u.Name, err)
+				return
+			}
+		case <-u.ctx.Done():
 			return
 		}
 	}
@@ -135,7 +143,7 @@ func (u *User) ShowMessage() {
 // OffLine 用户下线
 func (u *User) OffLine() {
 	u.offlineOnce.Do(func() {
-		close(u.done) // 通知所有goroutine退出
+		u.cancel()
 
 		u.Server.DeleteOnlineMap(u)
 
@@ -143,7 +151,9 @@ func (u *User) OffLine() {
 
 		close(u.C)
 
-		u.Conn.Close()
+		if err := u.Conn.Close(); err != nil {
+			log.Printf("关闭用户 %s 连接失败: %v\n", u.Name, err)
+		}
 
 		runtime.Goexit()
 	})
